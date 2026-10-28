@@ -1,7 +1,9 @@
 import asyncio
+import ssl
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -9,20 +11,54 @@ from sqlalchemy.orm import DeclarativeBase
 
 from ..core.config import settings
 
+# Query params that asyncpg does NOT understand — must be stripped
+_ASYNCPG_STRIP_PARAMS = frozenset({"sslmode", "sslcert", "sslkey", "sslrootcert", "channel_binding"})
+
 
 def _async_url(url: str) -> str:
-    if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+asyncpg://", 1)
-    return url
+    """Convert a postgres:// or postgresql:// URL to postgresql+asyncpg://.
 
+    Strips query parameters that asyncpg rejects (sslmode, channel_binding, etc.).
+    """
+    if url.startswith("postgresql+asyncpg://"):
+        return url
+
+    # Normalize scheme for parsing — urlparse needs a valid scheme
+    if url.startswith("postgresql://"):
+        normalized = url
+    elif url.startswith("postgres://"):
+        normalized = "postgresql://" + url[len("postgres://"):]
+    else:
+        return url  # SQLite or other — pass through
+
+    parsed = urlparse(normalized)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    for bad in _ASYNCPG_STRIP_PARAMS:
+        params.pop(bad, None)
+    clean_query = urlencode({k: v[0] for k, v in params.items()})
+    clean = parsed._replace(query=clean_query, scheme="postgresql+asyncpg")
+    return urlunparse(clean)
+
+
+def _ssl_context() -> ssl.SSLContext | None:
+    """Return an SSL context for asyncpg when Neon requires SSL."""
+    if "neon.tech" in settings.database_url or "sslmode=require" in settings.database_url:
+        ctx = ssl.create_default_context()
+        return ctx
+    return None
+
+
+_connect_args: dict = {}
+_ssl_ctx = _ssl_context()
+if _ssl_ctx:
+    _connect_args["ssl"] = _ssl_ctx
 
 engine = create_async_engine(
     _async_url(settings.database_url),
     echo=settings.debug,
     pool_pre_ping=True,
     pool_recycle=300,
+    connect_args=_connect_args if _connect_args else {},
 )
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
